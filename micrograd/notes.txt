@@ -1,0 +1,192 @@
+========
+MICROGRAD
+========
+
+We build an expression out of numbers and operations (+, *, etc) that ends with the final number L (the "loss")
+
+For every input input number x in that expression, compute 
+
+dL/dx = "how much does L change if I nudge x a little?"
+
+That single quantity, stored as x.grad is the whole point.
+Training a neural net is just compute dL/dx for every weight, then adjust each weight to make L smaller.
+
+=====
+DERIVATIVES
+=====
+
+The derivative of a function f at a point xc is the slope of f: rise over run, as the run shrinks to zero.
+
+f'(x) = lim h->0         f(x+h) - f(x) 
+                        -------
+                            h
+
+In words: bump the input by a tiny h, see how much the output moved, divide by h. That ratio is the slope 
+
+Example f(x) = x² 
+        f(x+h) - f(x)/h 
+
+        (x+h)² - x²/h = (x² + 2xh + h² - x²) / h
+
+        = 2x + h -> 2x as h -> 0
+
+so d/dx = (x²) = 2x 
+
+=====
+Numerical picture (how to sanity check everything)
+=====
+We don't even need calculus to estmate everything.
+
+Pick a tiny h (e0.0001)
+
+Compute: dL/dx ~= L(x+h) - L(x) / h 
+
+This is the finite difference. It is slow and approximate, but its the ground truth if our calculus based gradint disagrees, our calculus is wrong.
+
+====
+The five rules we need 
+====
+(a) constant rule: d/dx (c) = 0
+(b) Power rule: d/dx (x^n) = n * x^(n-1)
+(c) Sum rule:  d/dx (u + v) = du/dx + dv/dx 
+(d) Product rule: d/dx (u * v) = u*(dv/dx) + v*(du/dx)
+(e) Chain rule. we'll get to that
+
+====
+Chain rule
+====
+
+Suppiose L depends on x only thru an intermediate value U
+
+That is: u depends on x, and L depends on u.
+
+x -> u -> L 
+
+Then the slopes multiply:
+
+dL/dx = dL/du * du/dx
+
+Intuition if u changes 3x as fast as x, L changes 2x as fast as u, then L changes 6x as fast x. Rates of change chain by multiplication.
+
+Thisi s why each operations only needs to know its OWN little derivative. to get dL/x, take the gradient that alreasdy arrived from the right (dL/du), and multiply by the local slope.
+
+In code, every _backward() has exactly this shape:
+
+x.grad += (local slope du/dx) * u.grad
+
+=====
+THE GRAPH
+====
+
+Every Value remembers the op that made it and its inputs (_prev).
+So the whole expression is a graph: leaves (inputs/weights) -> ops -> L
+
+Forward pass:  walk left-to-right, fill each .data
+Backward pass: walk right-to-left, fill each .grad via the chain rule
+That right-to-left walk IS backpropagation.
+
+====
+LOCAL DERIVATIVES OF EACH OP
+====
+For out = f(a,b), ask dout/da and dout/db, then chain by *out.grad.
+
+ADD   out = a + b      dout/da = 1,  dout/db = 1
+                       a.grad += out.grad ; b.grad += out.grad
+                       (a "+" just copies the gradient to both inputs)
+
+MUL   out = a * b      dout/da = b,  dout/db = a
+                       a.grad += b * out.grad ; b.grad += a * out.grad
+                       (a "*" swaps values: each scaled by the other)
+
+POW   out = a^n        dout/da = n * a^(n-1)
+                       a.grad += n * a^(n-1) * out.grad
+
+TANH  out = tanh(x)    d/dx tanh = 1 - tanh(x)^2
+                       with t = out.data:  x.grad += (1 - t^2) * out.grad
+                       (big x -> t -> +/-1 -> slope -> 0 = vanishing gradient)
+
+COMPOSITES (no new calculus, built from the above):
+   -a    = a * (-1)        a - b = a + (-b)        a / b = a * b^(-1)
+   that's why __neg__, __sub__, __truediv__ have no _backward of their own.
+
+====
+WHY +=  (a value used more than once)
+====
+If x feeds TWO things u and v that both reach L, x affects L through
+BOTH paths. Multivariable chain rule = ADD the contributions:
+
+   dL/dx = dL/du * du/dx  +  dL/dv * dv/dx
+
+Each path back to x contributes a term, and they SUM -> that's why
+code does  x.grad += ...  (accumulate), not  =  (overwrite, which
+would keep only one path = wrong).
+
+Proof: y = x + x. path1 slope 1, path2 slope 1 -> dy/dx = 2.
+Grads start at 0, so the first += just sets it (0 is the right start).
+This is the "doubling when a node branches" -- one node, two arrows out,
+gradients pile up where the edges leave.
+
+====
+DOING IT IN ORDER (reverse-mode autodiff)
+====
+Rule: before using out.grad to feed out's inputs, out.grad must be
+finished -- every node that consumes out must run first.
+
+Fix: topological sort (every node after its inputs; leaves first, L last),
+then walk it in REVERSE (L first):
+
+   L.grad = 1                 # seed: dL/dL = 1
+   for node in reversed(topo):
+       node._backward()
+
+One pass fills the whole graph, same cost order as the forward pass.
+That efficiency is the whole reason backprop matters.
+
+====
+A SINGLE NEURON
+====
+   s = w1*x1 + ... + wn*xn + b      (pre-activation)
+   o = tanh(s)                      (output)
+
+   do/ds = 1 - o^2
+   ds/dwi = xi ,  ds/db = 1 ,  ds/dxi = wi
+   chain:
+       do/dwi = (1 - o^2) * xi
+       do/db  = (1 - o^2)
+       do/dxi = (1 - o^2) * wi
+   (multiply by dL/do, delivered by backprop as o.grad)
+
+====
+LAYER & MLP
+====
+LAYER = many neurons on the same inputs. No new math; the shared inputs
+fan out to every neuron, so their grads accumulate (+= again).
+
+MLP   = stacked layers, each layer's output is the next one's input:
+   x -> layer1 -> layer2 -> ... -> L
+The chain rule just stretches across the whole stack -- gradient enters
+at L and multiplies back through every layer, one local slope at a time.
+
+====
+THE LOSS & THE UPDATE (what grads are FOR)
+====
+Loss = how wrong the net is, e.g. squared error:
+   L = sum ( p - y )^2          d/dp (p-y)^2 = 2*(p - y)
+
+backward() pushes that from L to every weight. Then step downhill:
+
+   w <- w - lr * (dL/dw)
+   dL/dw > 0 : raising w raises L -> lower w
+   dL/dw < 0 : raising w lowers L -> raise w
+   lr = step size
+
+Loop: forward -> compute L -> zero_grad -> backward -> update.
+zero_grad is required because of the += accumulation: without resetting,
+this step's grads pile onto last step's.
+
+====
+TL;DR
+====
+Backprop = the chain rule, applied node by node, in reverse topological
+order, accumulating (+=) wherever a value branches. PyTorch is the same
+thing with tensors and faster arithmetic.
