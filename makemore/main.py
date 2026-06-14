@@ -207,6 +207,30 @@ def train_mlp(params, X, Y, batch_size=32, max_steps=20000, learning_rate=0.1, s
         if step % 1000 == 0 or step == max_steps - 1:
             print(f"step {step}: loss {loss.item():.4f}")
     return params
+
+def evaluate_mlp(params, X, Y):
+    with torch.no_grad():
+        logits = mlp_forward(params, X)
+        loss = F.cross_entropy(logits, Y)
+    return loss.item()
+
+def sample_mlp(params, stoi, itos, block_size, num_samples=10, seed=2147483647):
+    g = torch.Generator().manual_seed(seed)
+    C, W1, b1, W2, b2 = params 
+    for _ in range(num_samples):
+        context = [0] * block_size 
+        out = []
+        while True:
+            x = torch.tensor([context], dtype=torch.long)
+            logits = mlp_forward(params, x)
+            probs = F.softmax(logits, dim=1)
+            ix = torch.multinomial(probs, num_samples=1, generator=g).item()
+            if ix == 0:
+                break 
+            out.append(itos[ix])
+            context = context[1:] + [ix]
+        print("".join(out))
+
 def main():
     words = load_words()
     N, stoi, itos = build_bigram_counts(words)
