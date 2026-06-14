@@ -124,7 +124,89 @@ def sample_bigram_linear(W, itos, num_samples=10, seed=2147483647):
             out.append(itos[ix])
         print("".join(out))
 
+def split_words(words, proportions=(0.8, 0.1, 0.1), seed=2147483647):
+    g = torch.Generator().manual_seed(seed)
+    """
+    Random permutation
+    e.g ()! / ()()!
+    """
+    order = torch.randperm(len(words), generator=g).tolist()
+    n_train = int(proportions[0] * len(words))
+    n_dev = int(proportions[1] * len(words))
+    train_idx = order[:n_train]
+    dev_idx = order[n_train:n_train + n_dev]
+    test_idx = order[n_train + n_dev:]
+    train_words = [words[i] for i in train_idx]
+    dev_words = [words[i] for i in dev_idx]
+    test_words = [words[i] for i in test_idx]
+    return train_words, dev_words, test_words
 
+def build_data(words, stoi, block_size):
+    """
+    Builds input/output pairs for a given context length (block_size).
+    The context starts filled with zeros (out . token) to represent "start of word 
+    Each step shifts the window and appends the current character index; the label is the next character
+    """
+    X, Y = [], []
+    for w in words:
+        context = [0] * block_size 
+        for ch in list(w) + ["."]:
+            ix = stoi[ch]
+            X.append(context)
+            Y.append(ix)
+            context = context[1:] + [ix]
+    X = torch.tensor(X, dtype=torch.long)
+    Y = torch.tensor(Y, dtype=torch.long)
+    return X, Y
+
+def init_mlp_parameters(vocab_size, block_size, n_emb=10, n_hidden=200, seed=2147483647):
+    """
+    seeds the RNG for reproducbiiltiy and creates the MLP parameters: embedding matrix C, hidden layer, weights/bias, outputs weights/bias
+    uses small random inits; hidden layer applies He init scaled for tanh (5/3 factor).
+    marks every tensor as requiring gradients so we can optimize them manually. vocab_size is 26, and block_size will be the context length.
+    """
+    g = torch.Generator().manual_seed(seed)
+    C = torch.randn((vocab_size, n_emb), generator=g) * 0.01 
+    W1 = torch.randn((block_size * n_emb, n_hidden), generator=g) * (5 / 3) / (block_size * n_emb) ** 0.5 
+    b1 = torch.zeros(n_hidden)
+    W2 = torch.randn((n_hidden, vocab_size), generator=g) * 0.01 
+    b2 = torch.zeros(vocab_size)
+    params = [C, W1, b1, W2, b2]
+    for p in params: 
+        p.requires_grad = True 
+    return params
+
+def mlp_forward(params, X):
+    """
+    Performs forward pass for MLP: embedding lookup, flatten, hidden tanh, and final logits 
+    Takes the parameter list plus a batch of indices shaped(batch_size, block_size) and returns the raw logits
+    """
+    C, W1, b1, W2, b2 = params 
+    emb = C[X]
+    emb_flat = emb.view(emb.shape[0], -1)
+    h = torch.tanh(emb_flat @ W1 + b1)
+    logits = h @ W2 + b2 
+    return logits 
+
+def train_mlp(params, X, Y, batch_size=32, max_steps=20000, learning_rate=0.1, seed=2147483647):
+    C, W1, b1, W2, b2 = params 
+    g = torch.Generator().manual_seed(seed)
+    for step in range(max_steps):
+        idx = torch.randint(0, X.shape[0], (batch_size,), generator=g)
+        Xb = X[idx]
+        Yb = Y[idx]
+        logits = mlp_forward(params, Xb)
+        loss = F.cross_entropy(logits, Yb)
+
+        for p in params:
+            p.grad = None 
+        loss.backward()
+        for p in params:
+            p.data -= learning_rate * p.grad
+
+        if step % 1000 == 0 or step == max_steps - 1:
+            print(f"step {step}: loss {loss.item():.4f}")
+    return params
 def main():
     words = load_words()
     N, stoi, itos = build_bigram_counts(words)
