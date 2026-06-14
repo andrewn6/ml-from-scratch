@@ -84,6 +84,60 @@ def build_bigram_dataset(words, stoi):
     Y = torch.tensor(ys, dtype=torch.long)
     return X, Y
 
+
+def split_words(words, proportions=(0.8, 0.1, 0.1), seed=2147483647):
+    """random permutation e.g ()! / ()()!"""
+    g = torch.Generator().manual_seed(seed)
+    order = torch.randperm(len(words), generator=g).tolist()
+    n_train = int(proportions[0] * len(words))
+    n_dev = int(proportions[1] * len(words))
+    train_idx = order[:n_train]
+    dev_idx = order[n_train:n_train + n_dev]
+    test_idx = order[n_train + n_dev:]
+    train_words = [words[i] for i in train_idx]
+    dev_words = [words[i] for i in dev_idx]
+    test_words = [words[i] for i in test_idx]
+    return train_words, dev_words, test_words
+
+
+def build_dataset(words, stoi, block_size):
+    """builds input/output pairs for a given context length (block_size). the context starts filled with zeros (our . token) to represent start of word. each step shifts the window and appends the current character index; the label is the next character."""
+    X, Y = [], []
+    for w in words:
+        context = [0] * block_size
+        for ch in list(w) + ["."]:
+            ix = stoi[ch]
+            X.append(context)
+            Y.append(ix)
+            context = context[1:] + [ix]
+    X = torch.tensor(X, dtype=torch.long)
+    Y = torch.tensor(Y, dtype=torch.long)
+    return X, Y
+
+
+def init_mlp_parameters(vocab_size, block_size, n_emb=10, n_hidden=200, seed=2147483647):
+    """seeds the rng for reproducibility and creates the mlp parameters: embedding matrix c, hidden layer weights/bias, output weights/bias. uses small random inits with he-style scaling for tanh. marks tensors to require grads."""
+    g = torch.Generator().manual_seed(seed)
+    C = torch.randn((vocab_size, n_emb), generator=g) * 0.01
+    W1 = torch.randn((block_size * n_emb, n_hidden), generator=g) * (5 / 3) / (block_size * n_emb) ** 0.5
+    b1 = torch.zeros(n_hidden)
+    W2 = torch.randn((n_hidden, vocab_size), generator=g) * 0.01
+    b2 = torch.zeros(vocab_size)
+    params = [C, W1, b1, W2, b2]
+    for p in params:
+        p.requires_grad = True
+    return params
+
+
+def mlp_forward(params, X):
+    """performs the forward pass: embedding lookup, flatten, hidden tanh, and final logits; returns raw scores for next tokens."""
+    C, W1, b1, W2, b2 = params
+    emb = C[X]
+    emb_flat = emb.view(emb.shape[0], -1)
+    h = torch.tanh(emb_flat @ W1 + b1)
+    logits = h @ W2 + b2
+    return logits
+
 """
 Initailize a learnable weight matrix, same shape as the count table, and optimize with manual gradient descent
 Cross entropy gives negative log-likelihood loss directly; we just backprop and update 
@@ -124,72 +178,9 @@ def sample_bigram_linear(W, itos, num_samples=10, seed=2147483647):
             out.append(itos[ix])
         print("".join(out))
 
-def split_words(words, proportions=(0.8, 0.1, 0.1), seed=2147483647):
-    g = torch.Generator().manual_seed(seed)
-    """
-    Random permutation
-    e.g ()! / ()()!
-    """
-    order = torch.randperm(len(words), generator=g).tolist()
-    n_train = int(proportions[0] * len(words))
-    n_dev = int(proportions[1] * len(words))
-    train_idx = order[:n_train]
-    dev_idx = order[n_train:n_train + n_dev]
-    test_idx = order[n_train + n_dev:]
-    train_words = [words[i] for i in train_idx]
-    dev_words = [words[i] for i in dev_idx]
-    test_words = [words[i] for i in test_idx]
-    return train_words, dev_words, test_words
-
-def build_data(words, stoi, block_size):
-    """
-    Builds input/output pairs for a given context length (block_size).
-    The context starts filled with zeros (out . token) to represent "start of word 
-    Each step shifts the window and appends the current character index; the label is the next character
-    """
-    X, Y = [], []
-    for w in words:
-        context = [0] * block_size 
-        for ch in list(w) + ["."]:
-            ix = stoi[ch]
-            X.append(context)
-            Y.append(ix)
-            context = context[1:] + [ix]
-    X = torch.tensor(X, dtype=torch.long)
-    Y = torch.tensor(Y, dtype=torch.long)
-    return X, Y
-
-def init_mlp_parameters(vocab_size, block_size, n_emb=10, n_hidden=200, seed=2147483647):
-    """
-    seeds the RNG for reproducbiiltiy and creates the MLP parameters: embedding matrix C, hidden layer, weights/bias, outputs weights/bias
-    uses small random inits; hidden layer applies He init scaled for tanh (5/3 factor).
-    marks every tensor as requiring gradients so we can optimize them manually. vocab_size is 26, and block_size will be the context length.
-    """
-    g = torch.Generator().manual_seed(seed)
-    C = torch.randn((vocab_size, n_emb), generator=g) * 0.01 
-    W1 = torch.randn((block_size * n_emb, n_hidden), generator=g) * (5 / 3) / (block_size * n_emb) ** 0.5 
-    b1 = torch.zeros(n_hidden)
-    W2 = torch.randn((n_hidden, vocab_size), generator=g) * 0.01 
-    b2 = torch.zeros(vocab_size)
-    params = [C, W1, b1, W2, b2]
-    for p in params: 
-        p.requires_grad = True 
-    return params
-
-def mlp_forward(params, X):
-    """
-    Performs forward pass for MLP: embedding lookup, flatten, hidden tanh, and final logits 
-    Takes the parameter list plus a batch of indices shaped(batch_size, block_size) and returns the raw logits
-    """
-    C, W1, b1, W2, b2 = params 
-    emb = C[X]
-    emb_flat = emb.view(emb.shape[0], -1)
-    h = torch.tanh(emb_flat @ W1 + b1)
-    logits = h @ W2 + b2 
-    return logits 
 
 def train_mlp(params, X, Y, batch_size=32, max_steps=20000, learning_rate=0.1, seed=2147483647):
-    C, W1, b1, W2, b2 = params 
+    C, W1, b1, W2, b2 = params
     g = torch.Generator().manual_seed(seed)
     for step in range(max_steps):
         idx = torch.randint(0, X.shape[0], (batch_size,), generator=g)
@@ -199,7 +190,7 @@ def train_mlp(params, X, Y, batch_size=32, max_steps=20000, learning_rate=0.1, s
         loss = F.cross_entropy(logits, Yb)
 
         for p in params:
-            p.grad = None 
+            p.grad = None
         loss.backward()
         for p in params:
             p.data -= learning_rate * p.grad
@@ -208,17 +199,18 @@ def train_mlp(params, X, Y, batch_size=32, max_steps=20000, learning_rate=0.1, s
             print(f"step {step}: loss {loss.item():.4f}")
     return params
 
+
 def evaluate_mlp(params, X, Y):
     with torch.no_grad():
         logits = mlp_forward(params, X)
         loss = F.cross_entropy(logits, Y)
     return loss.item()
 
+
 def sample_mlp(params, stoi, itos, block_size, num_samples=10, seed=2147483647):
     g = torch.Generator().manual_seed(seed)
-    C, W1, b1, W2, b2 = params 
     for _ in range(num_samples):
-        context = [0] * block_size 
+        context = [0] * block_size
         out = []
         while True:
             x = torch.tensor([context], dtype=torch.long)
@@ -226,22 +218,31 @@ def sample_mlp(params, stoi, itos, block_size, num_samples=10, seed=2147483647):
             probs = F.softmax(logits, dim=1)
             ix = torch.multinomial(probs, num_samples=1, generator=g).item()
             if ix == 0:
-                break 
+                break
             out.append(itos[ix])
             context = context[1:] + [ix]
         print("".join(out))
 
 def main():
     words = load_words()
+    train_words, dev_words, test_words = split_words(words)
     N, stoi, itos = build_bigram_counts(words)
     P = compute_probabilities(N)
     report_loss(words, P, stoi)
 
-    X, Y = build_bigram_dataset(words, stoi)
-    W = train_bigram_linear(X, Y)
-    loss = evaluate_bigram_linear(W, X, Y)
-    print(f"trained bigram loss: {loss:.4f}")
-    sample_bigram_linear(W, itos)
+    block_size = 3
+    vocab_size = len(stoi)
+    Xtr, Ytr = build_dataset(train_words, stoi, block_size)
+    Xdev, Ydev = build_dataset(dev_words, stoi, block_size)
+    Xte, Yte = build_dataset(test_words, stoi, block_size)
+
+    params = init_mlp_parameters(vocab_size, block_size)
+    params = train_mlp(params, Xtr, Ytr)
+    train_loss = evaluate_mlp(params, Xtr, Ytr)
+    dev_loss = evaluate_mlp(params, Xdev, Ydev)
+    print(f"mlp train loss: {train_loss:.4f}")
+    print(f"mlp dev loss: {dev_loss:.4f}")
+    sample_mlp(params, stoi, itos, block_size)
 
 
 if __name__ == "__main__":
