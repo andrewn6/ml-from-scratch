@@ -207,7 +207,7 @@ def evaluate_mlp(params, X, Y):
     return loss.item()
 
 
-def sample_mlp(params, stoi, itos, block_size, num_samples=10, seed=2147483647):
+def sample_mlp(params, stoi, itos, block_size, num_samples=10, seed=21474647):
     g = torch.Generator().manual_seed(seed)
     for _ in range(num_samples):
         context = [0] * block_size
