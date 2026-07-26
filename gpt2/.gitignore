@@ -1,0 +1,11 @@
+# tokenized dataset shards and eval data (large, regenerate with fineweb.py)
+# no trailing slash: these may be real dirs or symlinks to a shared data dir
+edu_fineweb10B
+hellaswag
+hellaswag_*.jsonl
+
+# training logs and checkpoints
+log
+
+__pycache__/
+*.py[oc]
