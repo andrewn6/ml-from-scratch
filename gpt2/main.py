@@ -8,7 +8,7 @@ import tiktoken
 import math
 import os
 import time
-from torch.distributed import init_process_group
+from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 from hellaswag import render_example, iterate_examples
@@ -483,37 +483,37 @@ for step in range(max_steps):
             decoded = enc.decode(tokens)
             print(f"rank {ddp_rank} sample {i}: {decoded}")
 
-            model.train()
-            optimizer.zero_grad()
-            loss_accum = 0.0 
-            for micro_step in range(grad_accum_steps):
-                x, y = train_loader.next_batch()
-                x, y = x.to(device), y.to(device)
-                if ddp:
-                    model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
-                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                    logits, loss = model(x,y)
-
-                loss = loss / grad_accum_steps
-                loss_accum += loss.detach()
-                loss.backward()
+    # do one step of the optimization
+    model.train()
+    optimizer.zero_grad()
+    loss_accum = 0.0
+    for micro_step in range(grad_accum_steps):
+        x, y = train_loader.next_batch()
+        x, y = x.to(device), y.to(device)
         if ddp:
-            dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
-        norm = torch.nn.utils.clip_grad_norm(model.parameters(), 1.0)
-        lr = get_lr(step)
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = lr
-        optimizer.step()
-        if device_type == "cuda":
-            torch.cuda.synchronize()
-        t1 = time.time()
-        dt = t1 - t0 
-        tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
-        tokens_per_sec = tokens_processed / dt 
-        if master_process:
-            print(f"step {step:5d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
-            with open(log_file, "a") as f:
-                f.write(f"{step} train {loss_accum.item():.6f}\n")
+            model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
+        with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+            logits, loss = model(x, y)
+        loss = loss / grad_accum_steps
+        loss_accum += loss.detach()
+        loss.backward()
+    if ddp:
+        dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    lr = get_lr(step)
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
+    optimizer.step()
+    if device_type == "cuda":
+        torch.cuda.synchronize()
+    t1 = time.time()
+    dt = t1 - t0
+    tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
+    tokens_per_sec = tokens_processed / dt
+    if master_process:
+        print(f"step {step:5d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
+        with open(log_file, "a") as f:
+            f.write(f"{step} train {loss_accum.item():.6f}\n")
 
 if ddp:
     destroy_process_group()
