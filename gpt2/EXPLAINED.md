@@ -14,7 +14,20 @@ Line numbers refer to `gpt2/main.py`.
 
 ## 0. The whole thing in one sentence
 
-Imagine a conveyor belt with 1024 slots on it. Each slot holds a list of 768 numbers.
+Start with what the model is, before what it contains. It is one very large mathematical
+function. Text goes in, and what comes out is a probability for every token that could come
+next. That is the entire job. Everything below is how that function is built.
+
+The name says the same thing. GPT is **G**enerative, it writes its own text rather than
+choosing from options. **P**re-trained, it learns from an enormous pile of general text first
+and can be specialized later. **T**ransformer, the architecture underneath, which is what these
+1200 lines are about.
+
+To generate, you run that function, sample a token from the distribution it gives you, stick
+that token on the end of your input, and run it again. Predict, sample, repeat.
+
+Now the shape of it. Imagine a conveyor belt with 1024 slots on it. Each slot holds a list of
+768 numbers.
 
 Twelve identical machines sit along the belt. Each machine does exactly two things. First it
 lets the slots pass information sideways to each other. That is attention. Then it lets each
@@ -85,6 +98,33 @@ This is the only place in the entire model where information moves between token
 Every other line treats each position alone. Hold onto that and the architecture stops being
 mysterious.
 
+### What attention is for
+
+Before any of the code, the problem it solves.
+
+Read these three phrases: the American shrew mole, one mole of carbon dioxide, the doctor took
+a biopsy of the mole. The word `mole` means something completely different in each one.
+
+Now look at what `wte` does on line 147. It is a lookup table. Token id goes in, vector comes
+out. So `mole` gets the exact same 768 numbers in all three phrases, because a lookup table has
+no idea what surrounds it. At that moment the model is holding one generic, blurry, averaged
+sense of `mole`, and nothing else.
+
+That is the problem. **Attention is what turns the generic vector into the specific one.**
+
+The embedding gives you the word's meaning out of context. Attention lets the surrounding
+tokens push it toward the meaning it has in _this_ sentence, moving it to a different part of
+the space, one that encodes "small burrowing animal" rather than "unit of chemical quantity".
+
+And attention is how information moves at all, including across long distances. In "the animal
+didn't cross the street because it was tired", when the model reaches `it`, something has to
+connect that pronoun back to `animal`, which is eight tokens back. Attention is the only
+mechanism in the model capable of doing that. Afterwards `it` is no longer a vague pronoun. It
+carries `animal` with it.
+
+So each token asks one question: **which other tokens are relevant to me right now?** The rest
+of this section is how that question gets asked in matrix form.
+
 ### The setup
 
 ```python
@@ -118,12 +158,21 @@ and each vector has a job:
 - **key**: here is what I am.
 - **value**: here is what I will hand over if you pick me.
 
+The one-line version, which is worth memorizing: **queries and keys decide which tokens matter.
+Values decide what information actually gets copied.** Those are two separate jobs, and keeping
+them separate is the whole design.
+
 The classic example. The token `creature` puts out a query that means roughly _are there any
 adjectives to my left describing me?_ The token `fluffy` puts out a key that means _I am an
 adjective describing a noun_. Those two vectors point in similar directions. Similar directions
 means a large dot product. So `creature` attends to `fluffy`, and `fluffy`'s value vector,
 which carries something like "make this noun fluffier", gets added into `creature`'s position
-on the belt.
+on the belt. The result sits in a different spot in the space than plain `creature` did: it now
+encodes a fluffy creature.
+
+A dot product, since everything below leans on it: multiply two vectors component by component
+and add up the results. It is one number, and it measures how aligned the two vectors are.
+Higher means stronger match, lower means weaker. That is the entire scoring mechanism.
 
 ```python
 k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)   # line 69
@@ -166,6 +215,22 @@ y    = attn @ V                                          # (B, nh, T, hs)
 query with token _j_'s key. Read it as: how much does position _i_ care about position _j_? The
 table is 1024 by 1024, and there is one of them per head, per batch element.
 
+**What softmax does**, since this equation is where it first bites. Those raw dot products are
+useless as weights. They are arbitrary sized, some negative, and they do not add up to
+anything. To blend other tokens' values together you need weights that behave like proportions:
+all positive, all summing to 1.
+
+Softmax gets you there in three moves. Raise `e` to the power of each score, which makes
+everything positive. Add all those results up to get a total. Divide each one by that total.
+Now every number is between 0 and 1 and the whole list sums to 1, with the biggest original
+score getting the biggest share.
+
+The row of weights that comes out is called the **attention pattern**, and it is readable. It
+says exactly how much this token is drawing from each other token. In "the animal didn't cross
+the street because it was tired", the row for `it` should put a lot of its weight on `animal`.
+Notice that attention is never picking one token. It is mixing many, with some contributing
+more than others.
+
 **Why divide by `sqrt(hs)`?**
 
 A dot product is a sum of 64 terms. Sums of many random terms get big, and there is a rate to
@@ -184,6 +249,12 @@ subtract the artifact back out. This is not a tuned heuristic, it is variance al
 **`is_causal=True` is the arrow of time.** Before the softmax, it adds `-inf` to every entry
 above the diagonal. Since `exp(-inf) = 0`, those entries become exactly zero probability, and
 token _i_ becomes structurally incapable of seeing token _i+1_.
+
+Worth asking why it is `-inf` and not just zero. If you zeroed the scores after the softmax,
+the surviving weights would no longer add up to 1, so they would stop being proportions and you
+would have to renormalize by hand. Doing it _before_ the softmax solves it in one move: `-inf`
+exponentiates to 0, that token contributes nothing to the total, and the remaining weights
+still sum to 1 automatically. You get the blocking and the normalization from the same step.
 
 This is what makes the whole thing trainable in parallel, and it is worth being precise about
 why. One forward pass on a 1024-token sequence gives you 1024 next-token predictions at once.
@@ -220,6 +291,35 @@ happy.
 Then `c_proj` mixes across the head boundary. Up until this line, head 5's output lives strictly
 in channels 320 to 383 and nowhere else. `c_proj` is what lets the heads' findings combine with
 each other. It also decides how loudly this whole attention layer writes back onto the belt.
+
+Which gives you the cleanest way to hold multi-head attention in your head. Adjectives updating
+nouns is only one of the many ways context can change a word's meaning, so you run 12 of these
+at once, each with its own idea of what to look for. **Every head proposes a change to the
+token's vector. The changes get summed, and the sum is what lands on the belt** at line 108.
+Twelve opinions, one edit.
+
+### The whole flow, in order
+
+Worth having the sequence memorized, because every line above is one step of it:
+
+```
+token embedding (no context yet)
+  -> build a query, key, and value for each token
+  -> compare each query against every key with a dot product
+  -> raw attention scores
+  -> scale by sqrt(head size), mask out the future
+  -> softmax into the attention pattern (weights summing to 1)
+  -> blend the value vectors using those weights
+  -> add the result back onto the token's vector, now with context
+```
+
+**A note on what is not here.** This is _self_-attention: queries, keys, and values all come
+from the same sequence. There is a variant called cross-attention where the queries come from
+one dataset and the keys and values come from another, say English text querying French text
+during translation, or an ongoing transcript querying audio. The machinery is identical. And
+because there is no notion of a future token to protect there, cross-attention has no causal
+mask. It does not appear in this file, but knowing it exists tells you which parts of the design
+above are essential and which are choices.
 
 ## 4. MLP (lines 85 to 97)
 
@@ -357,8 +457,22 @@ logits = self.lm_head(x)           # line 152: (B, T, C) -> (B, T, V)
 That 12-layer loop is where 85M of the 124M parameters live. The shape is `(64, 1024, 768)` at
 every single step of it. Nothing ever changes shape. The contents just get refined.
 
-`lm_head` is the unembedding. It takes each 768-number output vector and dots it against all
-50304 token vectors. A high dot product means "this direction is pointing at that token".
+`lm_head` is the unembedding, and it is the exact mirror of what `wte` did at the very start.
+`wte` was embedding: take a discrete token id and move it into the model's vector space.
+`lm_head` moves back the other way: take a vector and turn it into a score for every token in
+the vocabulary. Same shape, opposite jobs.
+
+Mechanically it takes each 768-number output vector and dots it against all 50304 token
+vectors. A high dot product means "this direction is pointing at that token".
+
+The 50304 raw scores that come out are called **logits**. One per token in the vocabulary, and
+higher means the model currently considers that token more likely. They are not probabilities
+yet, they are arbitrary sized and can be negative. Softmax is what converts them, exactly as it
+did inside attention.
+
+And notice what this is not. The model is not looking up an answer in a table. It builds one
+final vector out of the entire context, and then asks: which token vectors does this thing point
+toward most strongly?
 
 ```python
 if targets is not None:                                                       # line 154
@@ -809,6 +923,13 @@ model then conditions on its own mistake, it derails and never recovers. Truncat
 
 Line 475 samples an _index into the top-50 list_, not a vocabulary id. So line 477's `gather` is
 required to translate it back into a real token. Miss that step and you decode garbage.
+
+**The knob that is missing here is temperature.** The usual trick is to divide the logits by a
+number T before the softmax. A large T flattens the distribution, giving the unlikely tokens
+more of a share and producing weirder text. A small T sharpens it toward the top choice, giving
+safer and more repetitive text. T = 1 is the distribution exactly as the model reports it, and
+that is effectively what this code does, since line 469 softmaxes the logits untouched. So this
+file controls sampling entirely through top-k, not through temperature.
 
 Sampling rather than `argmax` because greedy decoding falls into repetition loops almost
 immediately. The `sample_rng` is a separate `Generator`, seeded at `42 + ddp_rank`, kept
