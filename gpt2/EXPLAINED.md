@@ -126,6 +126,12 @@ The `view` chops the 768 numbers into 12 contiguous slabs of 64. The `transpose(
 pulls the head axis up next to batch so torch treats `(B, nh)` as 64 x 12 = 768 completely
 independent 1024-by-64 attention problems, batched.
 
+Simply: a token's query is a list of 768 numbers. Cut that list into 12 chunks of 64.
+Chunk 0 (numbers 0 to 63) is head 0's query, chunk 1 (numbers 64 to 127) is head 1's
+query, and so on. No number is copied, computed, or thrown away. You just drew 11 dividing
+lines through a list you already had, and then told torch "treat each chunk as its own
+separate problem."
+
 That is the whole trick of multi-head attention. You are not running 12 attention layers.
 You are running one attention layer whose query/key/value spaces have been partitioned
 into 12 non-overlapping 64-dim subspaces, so head 3 can track subject-verb agreement while
@@ -154,6 +160,13 @@ token gets weight 0.999, everything else gets ~0, and the gradient through the s
 dies. Dividing by `sqrt(64) = 8` restores unit variance and keeps the distribution soft
 and trainable. This is not a heuristic, it is the variance algebra.
 
+Simply: a dot product is a sum of 64 terms. Sums of many random terms get big, and they
+get big at the rate `sqrt(how many terms)`, so 64 terms means roughly 8x bigger than one
+term. Softmax cares about the _gaps_ between scores, not their absolute size, so inflated
+scores mean inflated gaps, and softmax turns a big gap into "winner takes literally
+everything." Dividing by 8 undoes the inflation the summing caused. Nothing about the
+model wanted the scores that large, it was an artifact of adding up 64 numbers.
+
 **`is_causal=True` is the arrow of time.** It adds `-inf` to every entry above the
 diagonal before the softmax, so `exp(-inf) = 0` and token _i_ is structurally incapable of
 seeing token _i+1_. This is what makes the whole thing trainable in parallel: a single
@@ -177,6 +190,13 @@ Undo the head split: `(B, nh, T, hs)` back to `(B, T, C)`, gluing the 12 heads' 
 outputs side by side into one 768-vector. The `.contiguous()` is mandatory, not
 decorative: `transpose` only rewrites strides, it does not move bytes, and `view` refuses
 to operate on a non-contiguous tensor.
+
+Simply: memory is one long flat line of numbers. A tensor's shape is just a rule for
+walking that line, and `transpose` swaps the walking rule without touching a single byte,
+so the numbers are still physically laid out in the old order. `view` needs the numbers to
+be sitting in memory in exactly the order it is about to read them, so it refuses.
+`.contiguous()` does the actual copy that puts them in the new physical order, and then
+`view` is happy.
 
 Then `c_proj` mixes across the head boundary. Until this line, head 5's output lives
 strictly in channels 320 to 383. `c_proj` is what lets the heads' findings combine, and
@@ -252,6 +272,13 @@ normalization, no nonlinearity.
 LayerNorm itself: for each token's 768 numbers independently, subtract the mean, divide by
 the standard deviation, then apply a learned per-channel scale and shift. The volume knob
 that stops the accumulating stream from drifting to enormous magnitudes.
+
+Simply: it is grading on a curve. Take one token's 768 numbers, recenter them so they
+average 0, and rescale them so their spread is 1. The _pattern_ of which channels are high
+and which are low survives completely, only the overall loudness is standardized. So a
+layer downstream always receives numbers in a predictable range no matter what the 11
+layers before it decided to add. The learned scale and shift then let the model undo the
+standardization per channel if it turns out it wanted the loudness after all.
 
 ## 6. GPT, the outer shell (lines 112 to 156)
 
@@ -363,6 +390,14 @@ Scaling the _writing_ layers (`attn.c_proj` and `mlp.c_proj`, the only two that 
 into the stream) by `1/sqrt(24) = 0.204` keeps the stream at unit variance no matter how
 deep you stack. This is **not** applied to `c_attn` or `c_fc`, which read from the stream
 rather than write to it. That distinction is the whole point of the flag.
+
+Simply: 24 people each pour a cup of water into the same bucket, and the bucket overflows.
+The fix is to tell each person to pour less. How much less? If they each pour `1/sqrt(24)`
+of a cup, the bucket ends up exactly as full as one cup, because randomly-signed
+contributions partially cancel and so add up at the `sqrt` rate rather than linearly. Same
+`sqrt` bookkeeping as the attention scaling above, applied to depth instead of head size.
+And you only tell the _pourers_ to pour less, not the people reading the water level,
+which is exactly why the flag is on `c_proj` and not on `c_attn` or `c_fc`.
 
 ```python
 self.apply(self._init_weights)   # line 128
@@ -571,6 +606,11 @@ Dividing by `shift_mask.sum(dim=1)` rather than a fixed length is the "norm" in
 competes fairly against a 12-token one. Without it you would systematically pick the
 shortest option.
 
+Simply: loss is a cost, and every extra token adds more cost, so long endings always look
+worse than short ones just for being long. Comparing totals would be comparing the price
+of a weekly shop to the price of a sandwich. Dividing by the token count turns it into
+cost-per-token, which is the price-per-item comparison you actually wanted.
+
 `argmin` because lower loss means higher probability means "the model thinks this ending is
 most natural".
 
@@ -635,6 +675,12 @@ for micro_step in range(grad_accum_steps):        # line 490
 8x too large. You want the mean over all 524288 tokens. Divide each by 8 first, and the
 accumulated gradient comes out exactly equal to the true full-batch gradient.
 
+Simply: you want the class average across 8 classrooms. Each classroom hands you its own
+average, say 80, 90, and so on. Adding those 8 numbers gives 680, which is not an average
+of anything. You wanted 85. Since the classrooms are all the same size, dividing each one
+by 8 before adding gets you there. `backward()` only knows how to add into `.grad`, it has
+no way to divide at the end, so you do the dividing up front on line 497.
+
 **Line 494** is performance surgery. By default DDP fires an `all_reduce` across all GPUs
 after every `backward()`. During accumulation that is 8 full syncs of 124M gradients when
 you only need one. Setting the flag False on micro steps 0 to 6 and True on step 7
@@ -646,7 +692,16 @@ graph of all 8 micro batches, and you would OOM. You only want the number for pr
 **Line 495**, bfloat16 autocast. bf16 has the _same 8 exponent bits as fp32_, only fewer
 mantissa bits. That is why there is no `GradScaler` anywhere in this file: fp16 has 5
 exponent bits and gradients routinely underflow to zero, requiring loss scaling. bf16
-trades precision for range and sidesteps the whole problem. Autocast is selective: matmuls
+trades precision for range and sidesteps the whole problem.
+
+Simply: a float is stored like scientific notation, `1.2345 x 10^-7`. The exponent bits
+are the `10^-7` part and decide the smallest and largest number you can represent at all.
+The mantissa bits are the `1.2345` part and decide how many significant digits you keep.
+bf16 keeps fp32's full range and gives up digits, so a tiny gradient still exists, just
+sloppily. fp16 gave up range instead, so a tiny gradient becomes exactly 0.0 and is gone
+forever. Sloppy is recoverable, gone is not.
+
+Autocast is selective: matmuls
 run in bf16, but softmax, layernorm, and the loss stay in fp32 where precision actually
 matters. Master weights stay fp32 throughout.
 
@@ -1005,6 +1060,11 @@ The standard estimate for transformer training cost is `6 x params x tokens`:
 ```
 6 x 124,475,904 x 10,000,000,000  =  approximately 7.5 x 10^18 floating point operations
 ```
+
+Where the 6 comes from: every parameter is used in one multiply and one add per token, so
+2 operations for the forward pass. The backward pass costs twice the forward, because it
+computes both "how does the loss respond to my inputs" and "how does the loss respond to
+my weights," which is 4 more. 2 + 4 = 6, per parameter, per token.
 
 7.5 **exaFLOPs** to move one number from 10.82 to 3.29.
 
